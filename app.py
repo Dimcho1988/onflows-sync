@@ -4,10 +4,11 @@ import requests
 from urllib.parse import urlencode
 from datetime import datetime, timedelta
 from supabase import create_client
-from lib.etl import validate_transform, detect_artifacts
+from etl import validate_transform, detect_artifacts   # <-- фиксиран импорт
 
 st.set_page_config(page_title="onFlows — Strava sync v2", layout="wide")
 
+# --- Secrets ---
 STRAVA_CLIENT_ID = st.secrets.get("STRAVA_CLIENT_ID")
 STRAVA_CLIENT_SECRET = st.secrets.get("STRAVA_CLIENT_SECRET")
 APP_BASE_URL = st.secrets.get("APP_BASE_URL")
@@ -16,6 +17,7 @@ SUPABASE_KEY = st.secrets.get("SUPABASE_SERVICE_KEY")
 
 sb = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+# --- OAuth URLs ---
 def strava_auth_url():
     params = {
         "client_id": STRAVA_CLIENT_ID,
@@ -29,7 +31,7 @@ def strava_auth_url():
 def exchange_code_for_token(code: str):
     r = requests.post("https://www.strava.com/oauth/token", data={
         "client_id": STRAVA_CLIENT_ID,
-        "client_secret": STRAVA_CLIENT_SECRET,  # <-- без излишна кавичка
+        "client_secret": STRAVA_CLIENT_SECRET,     # FIXED
         "code": code,
         "grant_type": "authorization_code"
     }, timeout=30)
@@ -71,16 +73,19 @@ def sget(url, token, params=None):
     r.raise_for_status()
     return r.json()
 
+# ---- Strava Fetch ----
 def fetch_activities_since(token, after_epoch):
     acts, page = [], 1
     while True:
         batch = sget("https://www.strava.com/api/v3/athlete/activities", token, {
             "after": after_epoch, "page": page, "per_page": 50
         })
-        if not batch: break
+        if not batch:
+            break
         acts.extend(batch)
         page += 1
-        if page > 10: break
+        if page > 10:
+            break
     return acts
 
 def fetch_streams(token, activity_id):
@@ -89,6 +94,7 @@ def fetch_streams(token, activity_id):
         "keys": keys, "key_by_type": "true"
     })
 
+# ---- DB inserts ----
 def insert_activity_meta(act, athlete_id):
     sb.table("activities").upsert({
         "activity_id": act["id"],
@@ -106,36 +112,36 @@ def insert_activity_meta(act, athlete_id):
     }).execute()
 
 def insert_stream_rows(activity_id, rows):
-    chunk = []
+    batch = []
     for r in rows:
-        rr = dict(r); rr["activity_id"] = activity_id
-        chunk.append(rr)
-        if len(chunk) >= 500:
-            sb.table("raw_streams").insert(chunk).execute()
-            chunk = []
-    if chunk:
-        sb.table("raw_streams").insert(chunk).execute()
+        row = dict(r); row["activity_id"] = activity_id
+        batch.append(row)
+        if len(batch) >= 500:
+            sb.table("raw_streams").insert(batch).execute()
+            batch = []
+    if batch:
+        sb.table("raw_streams").insert(batch).execute()
 
 def insert_artifacts(activity_id, arts):
-    if not arts: return
-    to_insert = []
+    if not arts:
+        return
+    batch = []
     for a in arts:
         row = {
             "activity_id": activity_id,
             "ts_rel_s_from": a["ts_rel_s_from"],
             "ts_rel_s_to": a["ts_rel_s_to"],
             "kind": a["kind"],
-            "severity": a.get("severity",1),
-            "note": a.get("note","")
+            "severity": a.get("severity", 1),
+            "note": a.get("note", "")
         }
-        to_insert.append(row)
-        if len(to_insert) >= 500:
-            sb.table("stream_artifacts").insert(to_insert).execute()
-            to_insert = []
-    if to_insert:
-        sb.table("stream_artifacts").insert(to_insert).execute()
+        batch.append(row)
+        if len(batch) >= 500:
+            sb.table("stream_artifacts").insert(batch).execute()
+            batch = []
+    if batch:
+        sb.table("stream_artifacts").insert(batch).execute()
 
-from datetime import datetime, timedelta
 def last_sync_epoch(days=30):
     return int((datetime.utcnow() - timedelta(days=days)).timestamp())
 
@@ -157,17 +163,20 @@ def sync_after(athlete_id, token_dict, days=30):
                 try:
                     sb.rpc("rebuild_agg_30s", {"p_activity_id": a["id"]}).execute()
                 except Exception as ex:
-                    st.warning(f"rebuild_agg_30s failed for {a['id']}: {ex}")
+                    st.warning(f"⚠️ rebuild_agg_30s failed for {a['id']}: {ex}")
             sb.table("activities").update({"ingest_status": "done"}).eq("activity_id", a["id"]).execute()
             imported += 1
         except Exception as e:
             sb.table("activities").update({"ingest_status": f"error:{e}"}).eq("activity_id", a["id"]).execute()
-            st.warning(f"Streams import failed for {a['id']}: {e}")
+            st.warning(f"⛔ Stream import failed for {a['id']}: {e}")
     return imported
 
+# ---- UI ----
 st.title("onFlows — Strava sync (v2)")
+
 qs_code = st.query_params.get("code", None)
 qs_scope = st.query_params.get("scope", None)
+
 if "athlete" not in st.session_state:
     st.session_state["athlete"] = None
 
@@ -184,34 +193,37 @@ if qs_code and not st.session_state.get("athlete"):
                 "lastname": athlete.get("lastname"),
                 "profile": athlete.get("profile")
             }).execute()
-            st.session_state["athlete"] = {"id": athlete_id, "name": f"{athlete.get('firstname','')} {athlete.get('lastname','')}".strip()}
+            st.session_state["athlete"] = {
+                "id": athlete_id,
+                "name": f"{athlete.get('firstname','')} {athlete.get('lastname','')}".strip()
+            }
             n = sync_after(athlete_id, tok, days=30)
-            st.success(f"Connected as {st.session_state['athlete']['name']} (id {athlete_id}). Synced {n} activities (30 days).")
+            st.success(f"✅ Connected as {st.session_state['athlete']['name']} · Synced {n} activities (last 30 days)")
             st.query_params.clear()
         except Exception as e:
             st.error(f"OAuth failed: {e}")
 
 if not st.session_state["athlete"]:
-    st.write("Connect your Strava account to start syncing activities to Supabase.")
+    st.write("🔗 Connect your Strava account to start syncing activities to Supabase.")
     if st.button("Connect with Strava"):
         st.markdown(f"[Click to continue →]({strava_auth_url()})")
 else:
-    st.info(f"Connected: {st.session_state['athlete']['name']} (id {st.session_state['athlete']['id']})")
+    st.info(f"✅ Connected: {st.session_state['athlete']['name']} (id {st.session_state['athlete']['id']})")
     c1, c2, c3 = st.columns(3)
     with c1:
         if st.button("Sync last 7 days"):
             tok = get_tokens(st.session_state["athlete"]["id"])
-            if not tok: st.error("Missing tokens")
+            if not tok: st.error("❌ Missing tokens")
             else:
                 n = sync_after(st.session_state["athlete"]["id"], tok, days=7)
-                st.success(f"Synced {n} activities (7 days).")
+                st.success(f"✅ Synced {n} activities (7 days)")
     with c2:
         if st.button("Sync last 30 days"):
             tok = get_tokens(st.session_state["athlete"]["id"])
-            if not tok: st.error("Missing tokens")
+            if not tok: st.error("❌ Missing tokens")
             else:
                 n = sync_after(st.session_state["athlete"]["id"], tok, days=30)
-                st.success(f"Synced {n} activities (30 days).")
+                st.success(f"✅ Synced {n} activities (30 days)")
     with c3:
         if st.button("Rebuild 30s aggregates (all activities)"):
             with st.spinner("Rebuilding..."):
@@ -220,8 +232,8 @@ else:
                     ids = [r["activity_id"] for r in (res.data or [])]
                     for aid in ids:
                         sb.rpc("rebuild_agg_30s", {"p_activity_id": aid}).execute()
-                    st.success(f"Rebuilt aggregates for {len(ids)} activities.")
+                    st.success(f"✅ Rebuilt aggregates for {len(ids)} activities.")
                 except Exception as ex:
                     st.error(f"Rebuild failed: {ex}")
 
-    st.caption("Default artifacts: HR outliers removed, zero-speed pauses >30s, GPS jumps >50m, missing data >20%. Data saved in tables: activities, raw_streams, stream_artifacts; 30s bins in agg_streams_30s.")
+    st.caption("📌 Artifacts auto-detected: HR outliers, zero-speed pauses >30s, GPS jumps >50m, missing data >20%.\nStored in: activities, raw_streams, stream_artifacts, agg_streams_30s.")
