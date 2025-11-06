@@ -6,6 +6,40 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from supabase import create_client
+# --- DEBUG MODE (TEMPORARY) ---
+import streamlit as st, requests, json
+
+def debug_oauth():
+    qs = st.query_params
+    if "code" not in qs:
+        return
+    st.title("🔍 DEBUG: Strava OAuth Callback")
+    st.write("Query params:", dict(qs))
+
+    payload = {
+        "client_id": st.secrets["strava"]["client_id"],
+        "client_secret": st.secrets["strava"]["client_secret"],
+        "code": qs["code"],
+        "grant_type": "authorization_code",
+        "redirect_uri": st.secrets["strava"]["oauth_redirect_uri"],
+    }
+    try:
+        r = requests.post("https://www.strava.com/oauth/token", data=payload, timeout=10)
+    except Exception as e:
+        st.error("❌ Request error:")
+        st.exception(e)
+        st.stop()
+
+    st.write("HTTP status:", r.status_code)
+    try:
+        st.code(json.dumps(r.json(), indent=2, ensure_ascii=False))
+    except:
+        st.code(r.text)
+
+    st.stop()
+
+debug_oauth()
+# --- END DEBUG MODE ---
 
 # ───────────────────────────
 # Secrets (TOML) → env vars
