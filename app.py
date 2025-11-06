@@ -29,7 +29,7 @@ def strava_auth_url():
 def exchange_code_for_token(code: str):
     r = requests.post("https://www.strava.com/oauth/token", data={
         "client_id": STRAVA_CLIENT_ID,
-        "client_secret": STRAVA_CLIENT_SECRET",
+        "client_secret": STRAVA_CLIENT_SECRET,  # <-- без излишна кавичка
         "code": code,
         "grant_type": "authorization_code"
     }, timeout=30)
