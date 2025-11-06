@@ -266,7 +266,7 @@ def main():
 
     # 1) Обработи redirect от Strava
     params = st.query_params
-    if params.get("code") and params.get("oauth_redirect") == "1":
+    if params.get("code"):
         try:
             tok = token_from_code(params.get("code"))
             athlete = tok.get("athlete") or {}
