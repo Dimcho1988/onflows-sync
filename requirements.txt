@@ -1,0 +1,5 @@
+streamlit>=1.39
+httpx>=0.27
+supabase>=2.6.0
+pandas>=2.2
+numpy>=1.26
