@@ -51,16 +51,17 @@ def validate_transform(streams: dict):
     return rows
 
 def detect_artifacts(rows):
-    art = []
-    if not rows: return art
+    arts = []
+    if not rows:
+        return arts
     total = len(rows)
     missing = 0
     for r in rows:
         if r["speed_ms"] is None and r["hr_bpm"] is None and r["altitude_m"] is None:
             missing += 1
-    miss_ratio = missing / max(1,total)
+    miss_ratio = missing / max(1, total)
     if miss_ratio >= DEFAULTS["missing_ratio_warn"]:
-        art.append({
+        arts.append({
             "ts_rel_s_from": rows[0]["ts_rel_s"],
             "ts_rel_s_to": rows[-1]["ts_rel_s"],
             "kind": "missing_data_ratio",
@@ -78,7 +79,7 @@ def detect_artifacts(rows):
                 start_ts = r["ts_rel_s"]
         else:
             if run_len >= thr:
-                art.append({
+                arts.append({
                     "ts_rel_s_from": start_ts,
                     "ts_rel_s_to": start_ts + run_len - 1,
                     "kind": "zero_speed_pause",
@@ -88,27 +89,22 @@ def detect_artifacts(rows):
             run_len = 0
             start_ts = None
     if run_len >= thr:
-        art.append({
+        arts.append({
             "ts_rel_s_from": start_ts,
             "ts_rel_s_to": start_ts + run_len - 1,
             "kind": "zero_speed_pause",
             "severity": 1,
             "note": f"duration={run_len}s"
         })
-    for i in range(1,len(rows)):
-        a, b = rows[i-1], rows[i]
-        def hv(a,b):
-            from_lat = a["lat"]; from_lon = a["lon"]; to_lat = b["lat"]; to_lon = b["lon"]
-            if None in (from_lat, from_lon, to_lat, to_lon):
-                return None
-            return haversine_m(from_lat, from_lon, to_lat, to_lon)
-        d = hv(a,b)
+    for i in range(1, len(rows)):
+        a, b = rows[i - 1], rows[i]
+        d = haversine_m(a["lat"], a["lon"], b["lat"], b["lon"])
         if d is not None and d > DEFAULTS["gps_jump_m"]:
-            art.append({
-                "ts_rel_s_from": b["ts_rel_s"]-1,
+            arts.append({
+                "ts_rel_s_from": b["ts_rel_s"] - 1,
                 "ts_rel_s_to": b["ts_rel_s"],
                 "kind": "gps_jump",
                 "severity": 2,
                 "note": f"jump_m={d:.1f}"
             })
-    return art
+    return arts
