@@ -1,114 +1,251 @@
-import math
+import streamlit as st
+import time, requests
+from urllib.parse import urlencode
+from datetime import datetime, timedelta
+from supabase import create_client
+from etl import validate_transform, detect_artifacts  # локален etl.py
 
-DEFAULTS = {
-    "hr_min": 40,
-    "hr_max": 230,
-    "min_speed_ms": 0.2,
-    "zero_speed_pause_sec": 30,
-    "gps_jump_m": 50.0,
-    "missing_ratio_warn": 0.2,
-}
+st.set_page_config(page_title="onFlows — Strava sync (v2)", layout="wide")
 
-def haversine_m(lat1, lon1, lat2, lon2):
-    if None in (lat1, lon1, lat2, lon2):
-        return None
-    R = 6371000.0
-    dlat = math.radians(lat2 - lat1)
-    dlon = math.radians(lon2 - lon1)
-    a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1))*math.cos(math.radians(lat2))*math.sin(dlon/2)**2
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
-    return R * c
+# --- Secrets ---
+STRAVA_CLIENT_ID     = st.secrets.get("STRAVA_CLIENT_ID")
+STRAVA_CLIENT_SECRET = st.secrets.get("STRAVA_CLIENT_SECRET")
+APP_BASE_URL         = st.secrets.get("APP_BASE_URL")              # напр. https://onflows-sync-2.streamlit.app
+SUPABASE_URL         = st.secrets.get("SUPABASE_URL")
+SUPABASE_KEY         = st.secrets.get("SUPABASE_SERVICE_KEY")
 
-def validate_transform(streams: dict):
-    t = streams.get("time", {}).get("data") or []
-    dist = streams.get("distance", {}).get("data") or []
-    latlng = streams.get("latlng", {}).get("data") or []
-    alt = streams.get("altitude", {}).get("data") or []
-    vel = streams.get("velocity_smooth", {}).get("data") or []
-    hr = streams.get("heartrate", {}).get("data") or []
-    cad = streams.get("cadence", {}).get("data") or []
-    rows = []
-    for i in range(len(t)):
-        hr_v = hr[i] if i < len(hr) else None
-        spd = vel[i] if i < len(vel) else None
-        if hr_v is not None and (hr_v < DEFAULTS["hr_min"] or hr_v > DEFAULTS["hr_max"]):
-            hr_v = None
-        if spd is not None and spd < DEFAULTS["min_speed_ms"]:
-            spd = 0.0
-        lat = lon = None
-        if i < len(latlng) and isinstance(latlng[i], list) and len(latlng[i]) == 2:
-            lat, lon = latlng[i]
-        rows.append({
-            "ts_rel_s": int(t[i]),
-            "dist_m": float(dist[i]) if i < len(dist) else None,
-            "speed_ms": float(spd) if spd is not None else None,
-            "hr_bpm": float(hr_v) if hr_v is not None else None,
-            "altitude_m": float(alt[i]) if i < len(alt) else None,
-            "cadence_spm": float(cad[i]) if i < len(cad) else None,
-            "lat": float(lat) if lat is not None else None,
-            "lon": float(lon) if lon is not None else None
+# Fail-fast ако липсва нещо важно
+missing = [k for k,v in {
+    "STRAVA_CLIENT_ID":STRAVA_CLIENT_ID,
+    "STRAVA_CLIENT_SECRET":STRAVA_CLIENT_SECRET,
+    "APP_BASE_URL":APP_BASE_URL,
+    "SUPABASE_URL":SUPABASE_URL,
+    "SUPABASE_SERVICE_KEY":SUPABASE_KEY}.items() if not v]
+if missing:
+    st.error("Missing secrets: " + ", ".join(missing) + ". "
+             "Open Streamlit Cloud → Settings → Secrets и попълни ключовете.")
+    st.stop()
+
+sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# --- OAuth helpers ---
+def strava_auth_url():
+    params = {
+        "client_id": STRAVA_CLIENT_ID,
+        "response_type": "code",
+        "redirect_uri": APP_BASE_URL,  # Strava връща ?code=... към този URL
+        "approval_prompt": "auto",
+        "scope": "read,activity:read_all,profile:read_all",
+    }
+    return "https://www.strava.com/oauth/authorize?" + urlencode(params)
+
+def exchange_code_for_token(code: str):
+    r = requests.post("https://www.strava.com/oauth/token", data={
+        "client_id": STRAVA_CLIENT_ID,
+        "client_secret": STRAVA_CLIENT_SECRET,
+        "code": code,
+        "grant_type": "authorization_code",
+    }, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+def refresh_if_needed(tok: dict):
+    now = int(time.time())
+    if tok["expires_at"] - now < 60:
+        r = requests.post("https://www.strava.com/oauth/token", data={
+            "client_id": STRAVA_CLIENT_ID,
+            "client_secret": STRAVA_CLIENT_SECRET,
+            "grant_type": "refresh_token",
+            "refresh_token": tok["refresh_token"],
+        }, timeout=30)
+        r.raise_for_status()
+        return r.json()
+    return tok
+
+# --- DB helpers ---
+def save_tokens(athlete_id: int, tok: dict, scope: str):
+    sb.table("oauth_tokens").upsert({
+        "athlete_id": athlete_id,
+        "access_token": tok["access_token"],
+        "refresh_token": tok.get("refresh_token", ""),
+        "expires_at": tok["expires_at"],
+        "scope": scope,
+    }).execute()
+
+def get_tokens(athlete_id: int):
+    res = sb.table("oauth_tokens").select("*").eq("athlete_id", athlete_id).execute()
+    data = res.data or []
+    return data[0] if data else None
+
+def sget(url, token, params=None):
+    r = requests.get(url, headers={"Authorization": f"Bearer {token}"}, params=params or {}, timeout=30)
+    if r.status_code == 429:
+        raise RuntimeError("Strava rate limit")
+    r.raise_for_status()
+    return r.json()
+
+# --- Strava pulls ---
+def fetch_activities_since(token, after_epoch):
+    acts, page = [], 1
+    while True:
+        batch = sget("https://www.strava.com/api/v3/athlete/activities", token, {
+            "after": after_epoch, "page": page, "per_page": 50,
         })
-    return rows
+        if not batch:
+            break
+        acts.extend(batch)
+        page += 1
+        if page > 10:
+            break
+    return acts
 
-def detect_artifacts(rows):
-    arts = []
-    if not rows:
-        return arts
-    total = len(rows)
-    missing = 0
+def fetch_streams(token, activity_id):
+    keys = "time,distance,latlng,altitude,velocity_smooth,heartrate,cadence,grade_smooth"
+    return sget(f"https://www.strava.com/api/v3/activities/{activity_id}/streams", token, {
+        "keys": keys, "key_by_type": "true",
+    })
+
+# --- Inserts ---
+def insert_activity_meta(act, athlete_id):
+    sb.table("activities").upsert({
+        "activity_id": act["id"],
+        "athlete_id": athlete_id,
+        "sport_type": act.get("sport_type") or act.get("type"),
+        "start_date_utc": act.get("start_date"),
+        "start_date_local": act.get("start_date_local"),
+        "elapsed_time_s": act.get("elapsed_time"),
+        "moving_time_s": act.get("moving_time"),
+        "distance_m": act.get("distance"),
+        "avg_speed_ms": act.get("average_speed"),
+        "avg_hr_bpm": act.get("average_heartrate"),
+        "name": act.get("name"),
+        "ingest_status": "active",
+    }).execute()
+
+def insert_stream_rows(activity_id, rows):
+    batch = []
     for r in rows:
-        if r["speed_ms"] is None and r["hr_bpm"] is None and r["altitude_m"] is None:
-            missing += 1
-    miss_ratio = missing / max(1, total)
-    if miss_ratio >= DEFAULTS["missing_ratio_warn"]:
-        arts.append({
-            "ts_rel_s_from": rows[0]["ts_rel_s"],
-            "ts_rel_s_to": rows[-1]["ts_rel_s"],
-            "kind": "missing_data_ratio",
-            "severity": 2,
-            "note": f"missing_ratio={miss_ratio:.2f}"
+        rr = dict(r); rr["activity_id"] = activity_id
+        batch.append(rr)
+        if len(batch) >= 500:
+            sb.table("raw_streams").insert(batch).execute()
+            batch = []
+    if batch:
+        sb.table("raw_streams").insert(batch).execute()
+
+def insert_artifacts(activity_id, arts):
+    if not arts:
+        return
+    batch = []
+    for a in arts:
+        batch.append({
+            "activity_id": activity_id,
+            "ts_rel_s_from": a["ts_rel_s_from"],
+            "ts_rel_s_to": a["ts_rel_s_to"],
+            "kind": a["kind"],
+            "severity": a.get("severity", 1),
+            "note": a.get("note", ""),
         })
-    thr = DEFAULTS["zero_speed_pause_sec"]
-    run_len = 0
-    start_ts = None
-    for r in rows:
-        spd = r["speed_ms"]
-        if spd is not None and spd == 0.0:
-            run_len += 1
-            if start_ts is None:
-                start_ts = r["ts_rel_s"]
-        else:
-            if run_len >= thr:
-                arts.append({
-                    "ts_rel_s_from": start_ts,
-                    "ts_rel_s_to": start_ts + run_len - 1,
-                    "kind": "zero_speed_pause",
-                    "severity": 1,
-                    "note": f"duration={run_len}s"
-                })
-            run_len = 0
-            start_ts = None
-    if run_len >= thr:
-        arts.append({
-            "ts_rel_s_from": start_ts,
-            "ts_rel_s_to": start_ts + run_len - 1,
-            "kind": "zero_speed_pause",
-            "severity": 1,
-            "note": f"duration={run_len}s"
-        })
-    for i in range(1, len(rows)):
-        a, b = rows[i - 1], rows[i]
-        def hv(a, b):
-            if None in (a["lat"], a["lon"], b["lat"], b["lon"]):
-                return None
-            return haversine_m(a["lat"], a["lon"], b["lat"], b["lon"])
-        d = hv(a, b)
-        if d is not None and d > DEFAULTS["gps_jump_m"]:
-            arts.append({
-                "ts_rel_s_from": b["ts_rel_s"] - 1,
-                "ts_rel_s_to": b["ts_rel_s"],
-                "kind": "gps_jump",
-                "severity": 2,
-                "note": f"jump_m={d:.1f}"
-            })
-    return arts
+        if len(batch) >= 500:
+            sb.table("stream_artifacts").insert(batch).execute()
+            batch = []
+    if batch:
+        sb.table("stream_artifacts").insert(batch).execute()
+
+def last_sync_epoch(days=30):
+    return int((datetime.utcnow() - timedelta(days=days)).timestamp())
+
+def sync_after(athlete_id, token_dict, days=30):
+    token_dict = refresh_if_needed(token_dict)
+    save_tokens(athlete_id, token_dict, token_dict.get("scope", ""))
+    access = token_dict["access_token"]
+
+    acts = fetch_activities_since(access, last_sync_epoch(days))
+    imported = 0
+    for a in acts:
+        insert_activity_meta(a, athlete_id)
+        try:
+            streams = fetch_streams(access, a["id"])
+            rows = validate_transform(streams)
+            if rows:
+                insert_stream_rows(a["id"], rows)
+                insert_artifacts(a["id"], detect_artifacts(rows))
+                try:
+                    sb.rpc("rebuild_agg_30s", {"p_activity_id": a["id"]}).execute()
+                except Exception as ex:
+                    st.warning(f"rebuild_agg_30s failed for {a['id']}: {ex}")
+            sb.table("activities").update({"ingest_status": "done"}).eq("activity_id", a["id"]).execute()
+            imported += 1
+        except Exception as e:
+            sb.table("activities").update({"ingest_status": f"error:{e}"}).eq("activity_id", a["id"]).execute()
+            st.warning(f"Streams import failed for {a['id']}: {e}")
+    return imported
+
+# --- UI ---
+st.title("onFlows — Strava sync (v2)")
+
+# ✅ Съвместим parse на query params (работи и на по-стари Streamlit версии)
+_qp = st.experimental_get_query_params()
+qs_code  = (_qp.get("code")  or [None])[0]
+qs_scope = (_qp.get("scope") or [None])[0]
+
+if "athlete" not in st.session_state:
+    st.session_state["athlete"] = None
+
+if qs_code and not st.session_state.get("athlete"):
+    with st.spinner("Completing Strava OAuth..."):
+        try:
+            tok = exchange_code_for_token(qs_code)
+            athlete = tok.get("athlete", {}) or {}
+            athlete_id = int(athlete.get("id"))
+            # Пишем само id + profile, без кирилица в текстови полета
+            sb.table("athletes").upsert({
+                "athlete_id": athlete_id,
+                "profile": athlete.get("profile"),
+            }).execute()
+            save_tokens(athlete_id, tok, qs_scope or "")
+            st.session_state["athlete"] = {"id": athlete_id, "name": f"Athlete {athlete_id}"}
+            n = sync_after(athlete_id, tok, days=30)
+            st.success(f"Connected · athlete_id {athlete_id}. Synced {n} activities (last 30 days).")
+        except Exception as e:
+            st.error(f"OAuth failed. Try again. ({type(e).__name__})")
+        finally:
+            # изчистваме query params по съвместимия начин
+            st.experimental_set_query_params()
+
+if not st.session_state["athlete"]:
+    st.write("Connect your Strava account to start syncing activities to Supabase.")
+    if st.button("Connect with Strava"):
+        st.markdown(f"[Click to continue →]({strava_auth_url()})")
+else:
+    st.info(f"Connected: {st.session_state['athlete']['name']} (id {st.session_state['athlete']['id']})")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        if st.button("Sync last 7 days"):
+            tok = get_tokens(st.session_state["athlete"]["id"])
+            if not tok:
+                st.error("Missing tokens")
+            else:
+                n = sync_after(st.session_state["athlete"]["id"], tok, days=7)
+                st.success(f"Synced {n} activities (7 days).")
+    with c2:
+        if st.button("Sync last 30 days"):
+            tok = get_tokens(st.session_state["athlete"]["id"])
+            if not tok:
+                st.error("Missing tokens")
+            else:
+                n = sync_after(st.session_state["athlete"]["id"], tok, days=30)
+                st.success(f"Synced {n} activities (30 days).")
+    with c3:
+        if st.button("Rebuild 30s aggregates (all activities)"):
+            with st.spinner("Rebuilding..."):
+                try:
+                    res = sb.table("activities").select("activity_id").eq("athlete_id", st.session_state["athlete"]["id"]).execute()
+                    ids = [r["activity_id"] for r in (res.data or [])]
+                    for aid in ids:
+                        sb.rpc("rebuild_agg_30s", {"p_activity_id": aid}).execute()
+                    st.success(f"Rebuilt aggregates for {len(ids)} activities.")
+                except Exception as ex:
+                    st.error(f"Rebuild failed: {ex}")
+
+    st.caption("Artifacts: HR outliers removed, zero-speed pauses >30s, GPS jumps >50m, missing data >20%. Data → activities, raw_streams, stream_artifacts, agg_streams_30s.")
