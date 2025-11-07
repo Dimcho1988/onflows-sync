@@ -22,18 +22,30 @@ missing = [k for k,v in {
     "SUPABASE_URL":SUPABASE_URL,
     "SUPABASE_SERVICE_KEY":SUPABASE_KEY}.items() if not v]
 if missing:
-    st.error("Missing secrets: " + ", ".join(missing) + ". "
-             "Open Streamlit Cloud → Settings → Secrets и попълни ключовете.")
+    st.error("Missing secrets: " + ", ".join(missing))
     st.stop()
 
 sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# --- Helpers ---
+def safe_text(x):
+    """Прави текста безопасен за инсерт (чист UTF-8, без емоджита ако не се поддържат)."""
+    if x is None:
+        return None
+    try:
+        s = str(x)
+        # премахваме characters, които могат да чупят ascii-пътища (емоджита и некодируеми)
+        s = s.encode("utf-8", "ignore").decode("utf-8")
+        return s
+    except Exception:
+        return None
 
 # --- OAuth helpers ---
 def strava_auth_url():
     params = {
         "client_id": STRAVA_CLIENT_ID,
         "response_type": "code",
-        "redirect_uri": APP_BASE_URL,  # Strava връща ?code=... към този URL
+        "redirect_uri": APP_BASE_URL,
         "approval_prompt": "auto",
         "scope": "read,activity:read_all,profile:read_all",
     }
@@ -69,7 +81,7 @@ def save_tokens(athlete_id: int, tok: dict, scope: str):
         "access_token": tok["access_token"],
         "refresh_token": tok.get("refresh_token", ""),
         "expires_at": tok["expires_at"],
-        "scope": scope,
+        "scope": safe_text(scope),
     }).execute()
 
 def get_tokens(athlete_id: int):
@@ -110,7 +122,7 @@ def insert_activity_meta(act, athlete_id):
     sb.table("activities").upsert({
         "activity_id": act["id"],
         "athlete_id": athlete_id,
-        "sport_type": act.get("sport_type") or act.get("type"),
+        "sport_type": safe_text(act.get("sport_type") or act.get("type")),
         "start_date_utc": act.get("start_date"),
         "start_date_local": act.get("start_date_local"),
         "elapsed_time_s": act.get("elapsed_time"),
@@ -118,7 +130,7 @@ def insert_activity_meta(act, athlete_id):
         "distance_m": act.get("distance"),
         "avg_speed_ms": act.get("average_speed"),
         "avg_hr_bpm": act.get("average_heartrate"),
-        "name": act.get("name"),
+        "name": safe_text(act.get("name")),
         "ingest_status": "active",
     }).execute()
 
@@ -142,9 +154,9 @@ def insert_artifacts(activity_id, arts):
             "activity_id": activity_id,
             "ts_rel_s_from": a["ts_rel_s_from"],
             "ts_rel_s_to": a["ts_rel_s_to"],
-            "kind": a["kind"],
+            "kind": safe_text(a["kind"]),
             "severity": a.get("severity", 1),
-            "note": a.get("note", ""),
+            "note": safe_text(a.get("note", "")),
         })
         if len(batch) >= 500:
             sb.table("stream_artifacts").insert(batch).execute()
@@ -173,18 +185,18 @@ def sync_after(athlete_id, token_dict, days=30):
                 try:
                     sb.rpc("rebuild_agg_30s", {"p_activity_id": a["id"]}).execute()
                 except Exception as ex:
-                    st.warning(f"rebuild_agg_30s failed for {a['id']}: {ex}")
+                    st.warning(f"rebuild_agg_30s failed for {a['id']}: {type(ex).__name__}")
             sb.table("activities").update({"ingest_status": "done"}).eq("activity_id", a["id"]).execute()
             imported += 1
         except Exception as e:
-            sb.table("activities").update({"ingest_status": f"error:{e}"}).eq("activity_id", a["id"]).execute()
-            st.warning(f"Streams import failed for {a['id']}: {e}")
+            sb.table("activities").update({"ingest_status": f"error:{type(e).__name__}"}).eq("activity_id", a["id"]).execute()
+            st.warning(f"Streams import failed for {a['id']}: {type(e).__name__}")
     return imported
 
 # --- UI ---
 st.title("onFlows — Strava sync (v2)")
 
-# ✅ Съвместим parse на query params (работи и на по-стари Streamlit версии)
+# Съвместим parse на query params
 _qp = st.experimental_get_query_params()
 qs_code  = (_qp.get("code")  or [None])[0]
 qs_scope = (_qp.get("scope") or [None])[0]
@@ -198,19 +210,21 @@ if qs_code and not st.session_state.get("athlete"):
             tok = exchange_code_for_token(qs_code)
             athlete = tok.get("athlete", {}) or {}
             athlete_id = int(athlete.get("id"))
-            # Пишем само id + profile, без кирилица в текстови полета
+
+            # Само id + profile (ASCII-safe)
             sb.table("athletes").upsert({
                 "athlete_id": athlete_id,
-                "profile": athlete.get("profile"),
+                "profile": safe_text(athlete.get("profile")),
             }).execute()
+
             save_tokens(athlete_id, tok, qs_scope or "")
             st.session_state["athlete"] = {"id": athlete_id, "name": f"Athlete {athlete_id}"}
+
             n = sync_after(athlete_id, tok, days=30)
             st.success(f"Connected · athlete_id {athlete_id}. Synced {n} activities (last 30 days).")
         except Exception as e:
             st.error(f"OAuth failed. Try again. ({type(e).__name__})")
         finally:
-            # изчистваме query params по съвместимия начин
             st.experimental_set_query_params()
 
 if not st.session_state["athlete"]:
@@ -246,6 +260,6 @@ else:
                         sb.rpc("rebuild_agg_30s", {"p_activity_id": aid}).execute()
                     st.success(f"Rebuilt aggregates for {len(ids)} activities.")
                 except Exception as ex:
-                    st.error(f"Rebuild failed: {ex}")
+                    st.error(f"Rebuild failed: {type(ex).__name__}")
 
-    st.caption("Artifacts: HR outliers removed, zero-speed pauses >30s, GPS jumps >50m, missing data >20%. Data → activities, raw_streams, stream_artifacts, agg_streams_30s.")
+    st.caption("Artifacts: HR outliers removed, zero-speed pauses >30s, GPS jumps >50m, missing data >20%. Saved to: activities, raw_streams, stream_artifacts, agg_streams_30s.")
