@@ -207,8 +207,8 @@ def sync_from_strava():
         after_ts = int(last_dt.timestamp()) - 60
         info_text = f"Синхронирам от последната записана активност: {last_dt}."
     else:
-        after_ts = int((datetime.now(timezone.utc) - timedelta(days=30)).timestamp())
-        info_text = "Няма активности в базата → дърпам последните 30 дни."
+        after_ts = int((datetime.now(timezone.utc) - timedelta(days=365)).timestamp())
+        info_text = "Няма активности в базата → дърпам последните 365 дни."
 
     st.write(info_text)
 
