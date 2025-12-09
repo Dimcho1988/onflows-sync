@@ -4,6 +4,30 @@ from datetime import datetime, timedelta, timezone
 import requests
 import streamlit as st
 from supabase import create_client, Client
+# --------- ВРЕМЕНЕН БЛОК: взимане на refresh_token от code ---------
+query_params = st.experimental_get_query_params()
+if "code" in query_params:
+    auth_code = query_params["code"][0]
+    st.write("Получен code от Strava:", auth_code)
+
+    token_url = "https://www.strava.com/oauth/token"
+    data = {
+        "client_id": STRAVA_CLIENT_ID,
+        "client_secret": STRAVA_CLIENT_SECRET,
+        "grant_type": "authorization_code",
+        "code": auth_code,
+    }
+    resp = requests.post(token_url, data=data, timeout=10)
+    st.write("DEBUG exchange status:", resp.status_code)
+    st.write("DEBUG exchange body:", resp.text)
+
+    if resp.ok:
+        token_info = resp.json()
+        st.success("Нов refresh_token (копирай и го сложи в secrets):")
+        st.code(token_info.get("refresh_token", "няма refresh_token"))
+        st.write("Scope на токена:", token_info.get("scope"))
+# -------------------------------------------------------------------
+
 
 # --------------------------
 # Конфигурация от secrets
