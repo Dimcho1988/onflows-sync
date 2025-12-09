@@ -13,9 +13,9 @@ STRAVA_CLIENT_SECRET = st.secrets["strava"]["client_secret"]
 STRAVA_REFRESH_TOKEN = st.secrets["strava"]["refresh_token"]
 
 SUPABASE_URL = st.secrets["supabase"]["url"]
-SUPABASE_SERVICE_ROLE_KEY = st.secrets["supabase"]["service_role_key"]
+SUPABASE_KEY = st.secrets["supabase"]["service_role_key"]  # може да е anon или service_role
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
 # --------------------------
@@ -76,13 +76,18 @@ def fetch_activity_streams(access_token: str, activity_id: int):
 # --------------------------
 def get_last_activity_start_date() -> datetime | None:
     """Последната start_date от activities (ако има такава)."""
-    res = (
-        supabase.table("activities")
-        .select("start_date")
-        .order("start_date", desc=True)
-        .limit(1)
-        .execute()
-    )
+    try:
+        res = (
+            supabase.table("activities")
+            .select("start_date")
+            .order("start_date", desc=True)
+            .limit(1)
+            .execute()
+        )
+    except Exception as e:
+        st.error(f"Supabase error при get_last_activity_start_date: {e}")
+        return None
+
     data = res.data
     if not data:
         return None
@@ -108,19 +113,27 @@ def upsert_activity(act: dict) -> int:
         "max_heartrate": act.get("max_heartrate"),
     }
 
-    res = (
-        supabase.table("activities")
-        .upsert(row, on_conflict="strava_activity_id")
-        .execute()
-    )
+    try:
+        res = (
+            supabase.table("activities")
+            .upsert(row, on_conflict="strava_activity_id")
+            .execute()
+        )
+    except Exception as e:
+        st.error(f"Supabase error при upsert_activity (activities): {e}")
+        # не вдигаме грешката, за да не падне цялото app
+        raise
 
     return res.data[0]["id"]
 
 
 def save_streams(activity_id: int, streams: dict) -> int:
     """Записва стриймовете в activity_streams."""
-    # трием старите, ако пре-синхронизираме
-    supabase.table("activity_streams").delete().eq("activity_id", activity_id).execute()
+    try:
+        supabase.table("activity_streams").delete().eq("activity_id", activity_id).execute()
+    except Exception as e:
+        st.error(f"Supabase error при изтриване на stream-ове: {e}")
+        raise
 
     rows = []
     for stream_type, payload in streams.items():
@@ -135,7 +148,12 @@ def save_streams(activity_id: int, streams: dict) -> int:
     if not rows:
         return 0
 
-    res = supabase.table("activity_streams").insert(rows).execute()
+    try:
+        res = supabase.table("activity_streams").insert(rows).execute()
+    except Exception as e:
+        st.error(f"Supabase error при insert в activity_streams: {e}")
+        raise
+
     return len(res.data)
 
 
@@ -164,15 +182,20 @@ def sync_from_strava():
     total_stream_rows = 0
 
     for act in activities:
-        local_id = upsert_activity(act)
-        new_acts += 1
+        try:
+            local_id = upsert_activity(act)
+            new_acts += 1
+        except Exception:
+            # грешката вече е показана с st.error в upsert_activity
+            continue
 
         try:
             streams = fetch_activity_streams(access_token, act["id"])
             total_stream_rows += save_streams(local_id, streams)
             time.sleep(0.3)  # малко забавяне за rate limit
-        except Exception as e:
-            st.warning(f"Грешка при стриймовете за activity {act['id']}: {e}")
+        except Exception:
+            # грешките са показани в save_streams
+            continue
 
     return new_acts, total_stream_rows
 
@@ -202,19 +225,23 @@ if st.button("Синхронизирай с Strava"):
                 f"Готово! Нови/обновени активности: {new_acts}, stream редове: {total_rows}"
             )
         except Exception as e:
-            st.error(f"Грешка при синхронизирането: {e}")
+            # ако нещо излезе извън локалните try/except
+            st.error(f"Неочаквана грешка при sync_from_strava: {e}")
 
-# Показваме последните 10 активности
-res = (
-    supabase.table("activities")
-    .select("*")
-    .order("start_date", desc=True)
-    .limit(10)
-    .execute()
-)
+st.subheader("Последни активности в базата")
 
-if res.data:
-    st.subheader("Последни активности в базата")
-    st.dataframe(res.data)
-else:
-    st.info("Все още няма записани активности.")
+try:
+    res = (
+        supabase.table("activities")
+        .select("*")
+        .order("start_date", desc=True)
+        .limit(10)
+        .execute()
+    )
+    if res.data:
+        st.dataframe(res.data)
+    else:
+        st.info("Все още няма записани активности.")
+except Exception as e:
+    st.warning(f"Не успях да заредя активности от Supabase: {e}")
+
