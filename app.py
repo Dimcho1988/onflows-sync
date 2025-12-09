@@ -40,7 +40,6 @@ def get_strava_access_token() -> str:
     token_info = resp.json()
     return token_info["access_token"]
 
-
 def fetch_activities_since(access_token: str, after_ts: int):
     """Връща всички активности след даден UNIX timestamp."""
     url = "https://www.strava.com/api/v3/athlete/activities"
@@ -53,7 +52,13 @@ def fetch_activities_since(access_token: str, after_ts: int):
     while True:
         params = {"after": after_ts, "page": page, "per_page": per_page}
         r = requests.get(url, headers=headers, params=params, timeout=10)
-        r.raise_for_status()
+
+        # ---- DEBUG ----
+        if r.status_code != 200:
+            st.error(f"Strava /athlete/activities ERROR {r.status_code}: {r.text}")
+            r.raise_for_status()
+        # ---------------
+
         chunk = r.json()
         if not chunk:
             break
