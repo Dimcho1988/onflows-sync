@@ -12,116 +12,73 @@ STRAVA_CLIENT_ID = st.secrets["strava"]["client_id"]
 STRAVA_CLIENT_SECRET = st.secrets["strava"]["client_secret"]
 
 SUPABASE_URL = st.secrets["supabase"]["url"]
-SUPABASE_KEY = st.secrets["supabase"]["service_role_key"]  # anon или service_role
+SUPABASE_KEY = st.secrets["supabase"]["service_role_key"]  # може и anon, но service_role е по-удобно за backend app
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
 # ==========================================================
-# 1) OAuth callback + зареждане на текущия потребител
+# 1) OAuth: code -> token_info, пазим в session_state
 # ==========================================================
-def load_current_user():
+def exchange_code_for_tokens(auth_code: str) -> dict | None:
+    """Разменя authorization code за token_info (access + refresh + athlete)."""
+    token_url = "https://www.strava.com/oauth/token"
+    data = {
+        "client_id": STRAVA_CLIENT_ID,
+        "client_secret": STRAVA_CLIENT_SECRET,
+        "grant_type": "authorization_code",
+        "code": auth_code,
+    }
+    resp = requests.post(token_url, data=data, timeout=10)
+    st.write("DEBUG exchange status:", resp.status_code)
+    st.write("DEBUG exchange body:", resp.text)
+
+    if not resp.ok:
+        st.error("Грешка при обмен на code за токени.")
+        return None
+
+    token_info = resp.json()
+    # по новия Strava OAuth, инфото за атлета е в отделен /athlete,
+    # но ти вече го дърпаше – можем да го вземем тук:
+    athlete_resp = requests.get(
+        "https://www.strava.com/api/v3/athlete",
+        headers={"Authorization": f"Bearer {token_info['access_token']}"},
+        timeout=10,
+    )
+    if not athlete_resp.ok:
+        st.error(
+            f"Грешка при /athlete: "
+            f"{athlete_resp.status_code} {athlete_resp.text}"
+        )
+        return None
+    token_info["athlete"] = athlete_resp.json()
+    return token_info
+
+
+def get_current_token_info() -> dict | None:
     """
-    Връща dict с текущия Strava user (от strava_users),
-    ако има такъв за тази сесия.
+    Връща token_info за текущия потребител от session_state,
+    или го създава, ако имаме ?code=... в URL-а.
     """
-    # 1) Ако току-що сме върнати от Strava с ?code=
+    # ако вече има token_info в сесията -> ползваме него
+    if "token_info" in st.session_state:
+        return st.session_state["token_info"]
+
+    # ако сме върнати от Strava с ?code=
     query_params = st.experimental_get_query_params()
     if "code" in query_params:
         auth_code = query_params["code"][0]
         st.info(f"Получен code от Strava: {auth_code}")
-
-        # обменяме code -> токени
-        token_url = "https://www.strava.com/oauth/token"
-        data = {
-            "client_id": STRAVA_CLIENT_ID,
-            "client_secret": STRAVA_CLIENT_SECRET,
-            "grant_type": "authorization_code",
-            "code": auth_code,
-        }
-        resp = requests.post(token_url, data=data, timeout=10)
-        st.write("DEBUG exchange status:", resp.status_code)
-        st.write("DEBUG exchange body:", resp.text)
-
-        if not resp.ok:
-            st.error("Грешка при обмен на code за токени.")
-            return None
-
-        token_info = resp.json()
-        access_token = token_info["access_token"]
-        refresh_token = token_info["refresh_token"]
-        scope = token_info.get("scope")
-
-        # взимаме инфо за атлета
-        athlete_resp = requests.get(
-            "https://www.strava.com/api/v3/athlete",
-            headers={"Authorization": f"Bearer {access_token}"},
-            timeout=10,
-        )
-        if not athlete_resp.ok:
-            st.error(
-                f"Грешка при /athlete: "
-                f"{athlete_resp.status_code} {athlete_resp.text}"
-            )
-            return None
-        athlete = athlete_resp.json()
-        athlete_id = athlete["id"]
-        name = (
-            athlete.get("username")
-            or f'{athlete.get("firstname","")} {athlete.get("lastname","")}'.strip()
-            or f"Athlete {athlete_id}"
-        )
-
-        # запис/ъпдейт в strava_users
-        try:
-            res = (
-                supabase.table("strava_users")
-                .upsert(
-                    {
-                        "strava_athlete_id": athlete_id,
-                        "name": name,
-                        "refresh_token": refresh_token,
-                    },
-                    on_conflict="strava_athlete_id",
-                )
-                .execute()
-            )
-            user_row = res.data[0]
-            st.success(
-                f"Свързан си със Strava като: {name} "
-                f"(athlete_id={athlete_id}), scope={scope}"
-            )
-        except Exception as e:
-            st.error(f"Supabase грешка при запис в strava_users: {e}")
-            return None
-
-        # помним го в session_state
-        st.session_state["current_athlete_id"] = athlete_id
-        return user_row
-
-    # 2) Ако вече имаме athlete_id в session_state -> зареждаме от базата
-    athlete_id = st.session_state.get("current_athlete_id")
-    if athlete_id:
-        try:
-            res = (
-                supabase.table("strava_users")
-                .select("*")
-                .eq("strava_athlete_id", athlete_id)
-                .limit(1)
-                .execute()
-            )
-            data = res.data
-            if data:
-                return data[0]
-        except Exception as e:
-            st.error(f"Supabase грешка при зареждане на текущия user: {e}")
-            return None
+        token_info = exchange_code_for_tokens(auth_code)
+        if token_info:
+            st.session_state["token_info"] = token_info
+            return token_info
 
     return None
 
 
 # ==========================================================
-# 2) STRAVA helper-и
+# 2) STRAVA helper-и (с refresh_token от token_info)
 # ==========================================================
 def get_strava_access_token(refresh_token: str) -> str:
     """Взима нов access_token от Strava чрез подаден refresh_token."""
@@ -183,7 +140,7 @@ def fetch_activity_streams(access_token: str, activity_id: int):
 
 
 # ==========================================================
-# 3) SUPABASE helper-и
+# 3) SUPABASE helper-и (user_id = Strava athlete_id)
 # ==========================================================
 def get_last_activity_start_date(user_id: int) -> datetime | None:
     """Последната start_date за даден user_id от activities (ако има такава)."""
@@ -209,7 +166,7 @@ def get_last_activity_start_date(user_id: int) -> datetime | None:
 def upsert_activity(act: dict, user_id: int) -> int:
     """Записва/обновява активност и връща локалното id в activities."""
     row = {
-        "user_id": user_id,
+        "user_id": user_id,  # тук ползваме Strava athlete_id
         "strava_activity_id": act["id"],
         "name": act.get("name"),
         "sport_type": act.get("sport_type"),
@@ -271,16 +228,21 @@ def save_streams(activity_id: int, streams: dict) -> int:
 # ==========================================================
 # 4) Sync pipeline за текущия потребител
 # ==========================================================
-def sync_from_strava(user_row: dict):
-    user_id = user_row["id"]               # локално id в strava_users
-    refresh_token = user_row["refresh_token"]
-    name = user_row.get("name") or f"user {user_id}"
+def sync_from_strava(token_info: dict):
+    athlete = token_info["athlete"]
+    athlete_id = athlete["id"]          # това ще е user_id в activities
+    name = (
+        athlete.get("username")
+        or f'{athlete.get("firstname","")} {athlete.get("lastname","")}'.strip()
+        or f"Athlete {athlete_id}"
+    )
 
-    st.write(f"Синхронирам Strava потребител: {name} (local id={user_id})")
+    st.write(f"Синхронирам Strava потребител: {name} (athlete_id={athlete_id})")
 
+    refresh_token = token_info["refresh_token"]
     access_token = get_strava_access_token(refresh_token)
 
-    last_dt = get_last_activity_start_date(user_id)
+    last_dt = get_last_activity_start_date(athlete_id)
     if last_dt:
         after_ts = int(last_dt.timestamp()) - 60
         info_text = (
@@ -300,7 +262,7 @@ def sync_from_strava(user_row: dict):
 
     for act in activities:
         try:
-            local_id = upsert_activity(act, user_id=user_id)
+            local_id = upsert_activity(act, user_id=athlete_id)
             new_acts += 1
         except Exception:
             continue
@@ -332,11 +294,10 @@ st.markdown(
 """
 )
 
-# Зареждаме текущия потребител (ако има такъв)
-current_user = load_current_user()
+token_info = get_current_token_info()
 
-# Ако нямаме свързан Strava акаунт → показваме бутон за свързване
-if not current_user:
+if not token_info:
+    # няма токени -> показваме линк за авторизация
     auth_url = (
         "https://www.strava.com/oauth/authorize"
         f"?client_id={STRAVA_CLIENT_ID}"
@@ -351,16 +312,17 @@ if not current_user:
     )
     st.stop()
 
-# Ако има свързан user:
+athlete = token_info["athlete"]
 st.success(
-    f"Свързан си със Strava като: {current_user.get('name')} "
-    f"(athlete_id={current_user.get('strava_athlete_id')})"
+    f"Свързан си със Strava като: "
+    f"{athlete.get('username') or athlete.get('firstname')} {athlete.get('lastname')}"
+    f" (athlete_id={athlete.get('id')})"
 )
 
 if st.button("Синхронизирай моите Strava активности"):
     with st.spinner("Синхронизирам..."):
         try:
-            new_acts, total_rows = sync_from_strava(current_user)
+            new_acts, total_rows = sync_from_strava(token_info)
             st.success(
                 f"Готово! Нови/обновени активности: {new_acts}, stream редове: {total_rows}"
             )
@@ -370,10 +332,11 @@ if st.button("Синхронизирай моите Strava активности"
 st.subheader("Последни мои активности в базата")
 
 try:
+    athlete_id = athlete["id"]
     res = (
         supabase.table("activities")
         .select("*")
-        .eq("user_id", current_user["id"])
+        .eq("user_id", athlete_id)
         .order("start_date", desc=True)
         .limit(20)
         .execute()
