@@ -31,6 +31,11 @@ def get_strava_access_token() -> str:
         "refresh_token": STRAVA_REFRESH_TOKEN,
     }
     resp = requests.post(token_url, data=data, timeout=10)
+
+    # DEBUG:
+    st.write("DEBUG /oauth/token status:", resp.status_code)
+    st.write("DEBUG /oauth/token body:", resp.text)
+
     resp.raise_for_status()
     token_info = resp.json()
     return token_info["access_token"]
