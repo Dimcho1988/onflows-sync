@@ -4,7 +4,24 @@ from datetime import datetime, timedelta, timezone
 import requests
 import streamlit as st
 from supabase import create_client, Client
-# --------- ВРЕМЕНЕН БЛОК: взимане на refresh_token от code ---------
+
+# --------------------------
+# Конфигурация от secrets
+# --------------------------
+STRAVA_CLIENT_ID = st.secrets["strava"]["client_id"]
+STRAVA_CLIENT_SECRET = st.secrets["strava"]["client_secret"]
+STRAVA_REFRESH_TOKEN = st.secrets["strava"]["refresh_token"]
+
+SUPABASE_URL = st.secrets["supabase"]["url"]
+SUPABASE_KEY = st.secrets["supabase"]["service_role_key"]  # може да е anon или service_role
+
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# ---------------------------------------------------------
+# ВРЕМЕНЕН БЛОК: взимане на refresh_token от ?code=... URL
+# (след като вземем новия refresh_token и го сложим в secrets,
+# този блок може спокойно да се изтрие)
+# ---------------------------------------------------------
 query_params = st.experimental_get_query_params()
 if "code" in query_params:
     auth_code = query_params["code"][0]
@@ -26,20 +43,7 @@ if "code" in query_params:
         st.success("Нов refresh_token (копирай и го сложи в secrets):")
         st.code(token_info.get("refresh_token", "няма refresh_token"))
         st.write("Scope на токена:", token_info.get("scope"))
-# -------------------------------------------------------------------
-
-
-# --------------------------
-# Конфигурация от secrets
-# --------------------------
-STRAVA_CLIENT_ID = st.secrets["strava"]["client_id"]
-STRAVA_CLIENT_SECRET = st.secrets["strava"]["client_secret"]
-STRAVA_REFRESH_TOKEN = st.secrets["strava"]["refresh_token"]
-
-SUPABASE_URL = st.secrets["supabase"]["url"]
-SUPABASE_KEY = st.secrets["supabase"]["service_role_key"]  # може да е anon или service_role
-
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+# ---------------------------------------------------------
 
 
 # --------------------------
@@ -56,13 +60,14 @@ def get_strava_access_token() -> str:
     }
     resp = requests.post(token_url, data=data, timeout=10)
 
-    # DEBUG:
+    # DEBUG
     st.write("DEBUG /oauth/token status:", resp.status_code)
     st.write("DEBUG /oauth/token body:", resp.text)
 
     resp.raise_for_status()
     token_info = resp.json()
     return token_info["access_token"]
+
 
 def fetch_activities_since(access_token: str, after_ts: int):
     """Връща всички активности след даден UNIX timestamp."""
@@ -77,11 +82,10 @@ def fetch_activities_since(access_token: str, after_ts: int):
         params = {"after": after_ts, "page": page, "per_page": per_page}
         r = requests.get(url, headers=headers, params=params, timeout=10)
 
-        # ---- DEBUG ----
+        # DEBUG за грешки
         if r.status_code != 200:
             st.error(f"Strava /athlete/activities ERROR {r.status_code}: {r.text}")
             r.raise_for_status()
-        # ---------------
 
         chunk = r.json()
         if not chunk:
@@ -155,7 +159,6 @@ def upsert_activity(act: dict) -> int:
         )
     except Exception as e:
         st.error(f"Supabase error при upsert_activity (activities): {e}")
-        # не вдигаме грешката, за да не падне цялото app
         raise
 
     return res.data[0]["id"]
@@ -220,7 +223,6 @@ def sync_from_strava():
             local_id = upsert_activity(act)
             new_acts += 1
         except Exception:
-            # грешката вече е показана с st.error в upsert_activity
             continue
 
         try:
@@ -228,7 +230,6 @@ def sync_from_strava():
             total_stream_rows += save_streams(local_id, streams)
             time.sleep(0.3)  # малко забавяне за rate limit
         except Exception:
-            # грешките са показани в save_streams
             continue
 
     return new_acts, total_stream_rows
@@ -259,7 +260,6 @@ if st.button("Синхронизирай с Strava"):
                 f"Готово! Нови/обновени активности: {new_acts}, stream редове: {total_rows}"
             )
         except Exception as e:
-            # ако нещо излезе извън локалните try/except
             st.error(f"Неочаквана грешка при sync_from_strava: {e}")
 
 st.subheader("Последни активности в базата")
