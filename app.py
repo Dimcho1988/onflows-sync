@@ -249,8 +249,8 @@ def sync_from_strava(token_info: dict):
             f"Синхронирам от последната записана активност за този юзер: {last_dt}."
         )
     else:
-        after_ts = int((datetime.now(timezone.utc) - timedelta(days=100)).timestamp())
-        info_text = "Няма активности в базата за този юзер → дърпам последните 100 дни."
+        after_ts = int((datetime.now(timezone.utc) - timedelta(days=10)).timestamp())
+        info_text = "Няма активности в базата за този юзер → дърпам последните 10 дни."
 
     st.write(info_text)
 
